@@ -12,7 +12,12 @@ if (string.IsNullOrWhiteSpace(apiKey))
 const string model = "openai/gpt-oss-20b";
 const string url = "https://api.groq.com/openai/v1/chat/completions";
 const int maxTurns = 3;
-var projectRoot = Path.GetFullPath(Directory.GetCurrentDirectory());
+var projectRoot = Path.GetFullPath(args.Length > 0 ? args[0] : Directory.GetCurrentDirectory());
+if (!Directory.Exists(projectRoot))
+{
+    Console.WriteLine($"Erro: a pasta '{projectRoot}' não existe.");
+    return;
+}
 var historyPath = Path.Combine(projectRoot, ".console-history.json");
 
 using var http = new HttpClient(new SocketsHttpHandler { UseProxy = false }) { Timeout = TimeSpan.FromSeconds(60) };
@@ -20,6 +25,7 @@ http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer
 
 var tools = JsonNode.Parse("""
 [
+  {"type":"function","function":{"name":"list_files","description":"Lista os arquivos e pastas dentro do projeto (recursivo), ignorando bin/obj/.git/node_modules. Use isso primeiro pra descobrir a estrutura do projeto antes de tentar ler um arquivo específico.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Subpasta relativa a listar, opcional — omita pra listar a partir da raiz do projeto."}},"required":[]}}},
   {"type":"function","function":{"name":"read_file","description":"Lê o conteúdo de um arquivo do projeto. Use line_start/line_end pra ler só um trecho de arquivos grandes, evitando gastar tokens à toa. Não releia um arquivo já lido nesta conversa sem necessidade.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Caminho relativo do arquivo."},"line_start":{"type":"integer","description":"Primeira linha (1-based), opcional."},"line_end":{"type":"integer","description":"Última linha (1-based), opcional."}},"required":["path"]}}},
   {"type":"function","function":{"name":"edit_file","description":"Edita um arquivo existente substituindo old_string (trecho pequeno, exato, único, copiado do read_file) por new_string. Nunca reescreva o arquivo inteiro.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Caminho relativo do arquivo."},"old_string":{"type":"string","description":"Trecho exato a substituir."},"new_string":{"type":"string","description":"Trecho novo."}},"required":["path","old_string","new_string"]}}},
   {"type":"function","function":{"name":"write_file","description":"Cria um arquivo NOVO (que ainda não existe). Para editar um arquivo existente, use edit_file.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Caminho relativo do arquivo."},"content":{"type":"string","description":"Conteúdo completo do novo arquivo."}},"required":["path","content"]}}}
@@ -30,6 +36,7 @@ var systemMessage = new JsonObject
 {
     ["role"] = "system",
     ["content"] = "Você é um assistente que ajuda a editar código na pasta do projeto atual. " +
+        "Se não souber quais arquivos existem no projeto, use list_files primeiro pra descobrir a estrutura. " +
         "Antes de editar um arquivo que já existe, SEMPRE chame read_file primeiro. " +
         "Para editar, use edit_file com old_string pequeno (só o trecho relevante) e new_string — nunca reescreva o arquivo inteiro. " +
         "Use write_file só para criar arquivo novo. Nunca invente conteúdo nem caminhos — use exatamente o que o usuário mencionou. " +
@@ -65,20 +72,29 @@ bool Confirm(string label)
     return string.Equals(Console.ReadLine()?.Trim(), "s", StringComparison.OrdinalIgnoreCase);
 }
 
+string[] IgnoredDirs = { "bin", "obj", ".git", "node_modules" };
+
 string ExecuteTool(string name, JsonNode? args, string root)
 {
-    var path = args?["path"]?.GetValue<string>();
-    if (string.IsNullOrWhiteSpace(path))
-        return "Erro: parâmetro 'path' ausente.";
-
+    var path = args?["path"]?.GetValue<string>() ?? "";
     var fullPath = Path.GetFullPath(Path.Combine(root, path));
     if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
         return $"Erro: acesso negado, '{path}' está fora da pasta do projeto.";
+
+    if (name != "list_files" && string.IsNullOrWhiteSpace(path))
+        return "Erro: parâmetro 'path' ausente.";
 
     try
     {
         switch (name)
         {
+            case "list_files":
+                if (!Directory.Exists(fullPath)) return $"Erro: pasta '{path}' não encontrada.";
+                var entries = Directory.EnumerateFileSystemEntries(fullPath, "*", SearchOption.AllDirectories)
+                    .Where(p => !p.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Any(IgnoredDirs.Contains))
+                    .Select(p => Path.GetRelativePath(root, p));
+                return string.Join('\n', entries);
+
             case "read_file":
                 if (!File.Exists(fullPath)) return $"Erro: arquivo '{path}' não encontrado.";
                 var lines = File.ReadAllLines(fullPath);
